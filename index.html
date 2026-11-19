@@ -89,7 +89,7 @@ function showPairing() {
   say(key ? `Paired as ${getItem(NAME_ITEM) || DEFAULT_NAME}. Write, then tap OK.`
           : 'Not paired. On the Mac run: sketchpad pair-airdrop iPad, then paste the link below.', key ? '' : 'err');
 }
-pairbtn.onclick = () => {
+const pairNow = () => {
   const ok = pairFrom(pairlink.value.trim());
   pairlink.value = '';  // never leave the key sitting in the box
   key = getItem(KEY_ITEM);
@@ -159,12 +159,20 @@ const end = () => { if (cur) { drawStroke(bctx, cur, dpr); cur = null; paint(); 
 cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end);
 document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
 
+// Buttons react to a Pencil tap as well as a finger or mouse: run on pointerup from any pointer,
+// and ignore the click that may follow, so an action never runs twice.
+function tap(el, fn) {
+  let last = 0;
+  el.addEventListener('pointerup', e => { if (e.button > 0) return; last = Date.now(); e.preventDefault(); fn(); });
+  el.addEventListener('click', e => { if (Date.now() - last > 600) fn(); });
+}
 function setMode(m) { mode = m; pen.classList.toggle('on', m === 'pen'); eraser.classList.toggle('on', m === 'eraser'); }
-pen.onclick = () => setMode('pen');
-eraser.onclick = () => setMode('eraser');
-undo.onclick = () => { strokes.pop(); rebuild(); };
+tap(pen, () => setMode('pen'));
+tap(eraser, () => setMode('eraser'));
+tap(undo, () => { strokes.pop(); rebuild(); });
 function wipe() { strokes = []; rebuild(); }
-clear.onclick = () => { wipe(); say('Cleared.'); };
+tap(clear, () => { wipe(); say('Cleared.'); });
+tap(pairbtn, pairNow);
 
 function say(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
 
@@ -211,13 +219,14 @@ async function sendWifi(blob) {
   } catch (err) { say("Can't reach the Mac. Is Sketchpad running, and is this network approved?", 'err'); }
 }
 
-ok.onclick = async () => {
+tap(ok, async () => {
+  if (ok.disabled) return;
   const blob = await exportPng();
   if (!blob) return say('Nothing written yet.', 'err');
   ok.disabled = true; say('Sending…');
   await (AIRDROP ? sendAirDrop(blob) : sendWifi(blob));
   ok.disabled = false;
-};
+});
 
 window.addEventListener('resize', resize);
 resize();
