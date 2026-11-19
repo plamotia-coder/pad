@@ -25,6 +25,9 @@
   #status { width:100%; font-size:13px; min-height:1em; color:#555; }
   #status.err { color:var(--err); } #status.good { color:var(--ok); }
   #route { font-size:12px; color:#777; }
+  #pairbox { width:100%; display:flex; gap:6px; }
+  #pairbox[hidden] { display:none; }
+  #pairlink { flex:1; font:inherit; padding:8px; border:1px solid var(--line); border-radius:8px; min-width:0; -webkit-user-select:text; user-select:text; }
   #wrap { flex:1; position:relative; touch-action:none; }
   canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
 </style>
@@ -38,6 +41,11 @@
   <span id="route"></span>
   <button id="ok">OK</button>
   <div id="status">Write with the Pencil, then tap OK.</div>
+  <div id="pairbox" hidden>
+    <input id="pairlink" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+           placeholder="Paste the pairing link here (from: sketchpad pair-airdrop iPad)">
+    <button id="pairbtn">Pair</button>
+  </div>
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
@@ -57,20 +65,38 @@ function getItem(k) { try { return localStorage.getItem(k); } catch (e) { return
 function setItem(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
 // Pairing: the Mac's pair-airdrop link carries the key in the #fragment, which never leaves this device.
-if (AIRDROP && location.hash.includes('pair=')) {
-  const h = new URLSearchParams(location.hash.slice(1));
+// It can arrive in the address bar (Safari) or be pasted into the box (Home Screen app, which has its
+// own storage and no address bar).
+function pairFrom(text) {
+  const h = new URLSearchParams((text.split('#')[1] || ''));
   const newKey = h.get('pair') || '', old = getItem(KEY_ITEM);
+  if (!/^[0-9a-f]{64}$/.test(newKey)) return false;
   // Ask before a link replaces an existing pairing (a stranger's link would otherwise silently break it).
-  if (/^[0-9a-f]{64}$/.test(newKey) && (!old || old === newKey ||
-      confirm('This device is already paired. Replace its key with the one in this link?'))) {
-    setItem(KEY_ITEM, newKey);
-    setItem(NAME_ITEM, (h.get('name') || DEFAULT_NAME).slice(0, 40));
-  }
+  if (old && old !== newKey && !confirm('This device is already paired. Replace its key with the one in this link?')) return false;
+  setItem(KEY_ITEM, newKey);
+  setItem(NAME_ITEM, (h.get('name') || DEFAULT_NAME).slice(0, 40));
+  return true;
+}
+if (AIRDROP && location.hash.includes('pair=')) {
+  pairFrom(location.href);
   history.replaceState(null, '', location.pathname);  // remove the key from the address bar
 }
-const key = AIRDROP ? getItem(KEY_ITEM) : null;
+let key = AIRDROP ? getItem(KEY_ITEM) : null;
 route.textContent = AIRDROP ? 'AirDrop' : 'Wi-Fi';
-if (AIRDROP) say(key ? `Paired as ${getItem(NAME_ITEM) || DEFAULT_NAME}. Write, then tap OK.` : NOT_PAIRED, key ? '' : 'err');
+function showPairing() {
+  if (!AIRDROP) return;
+  pairbox.hidden = !!key;
+  say(key ? `Paired as ${getItem(NAME_ITEM) || DEFAULT_NAME}. Write, then tap OK.`
+          : 'Not paired. On the Mac run: sketchpad pair-airdrop iPad, then paste the link below.', key ? '' : 'err');
+}
+pairbtn.onclick = () => {
+  const ok = pairFrom(pairlink.value.trim());
+  pairlink.value = '';  // never leave the key sitting in the box
+  key = getItem(KEY_ITEM);
+  showPairing();
+  if (!ok) say("That isn't a pairing link. Copy it again with: sketchpad pair-airdrop iPad", 'err');
+};
+showPairing();
 
 if (AIRDROP && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
