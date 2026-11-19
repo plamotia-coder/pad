@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Sketchpad">
+<meta name="robots" content="noindex, nofollow">
+<!-- Only this page's own code may run, and it may only talk to where it came from (the Mac, or nowhere on GitHub). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'self'; worker-src 'self'; manifest-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%231f9d55'/%3E%3Cpath d='M3 12 L11 4 L13 6 L5 14 Z' fill='white'/%3E%3C/svg%3E">
+<title>Sketchpad</title>
+<style>
+  :root { --bg:#ffffff; --bar:#f2f2f4; --ink:#111; --line:#d0d0d6; --accent:#0a7cff; --ok:#1f9d55; --err:#c0392b; }
+  * { box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  html, body { margin:0; height:100%; background:var(--bg); font:15px -apple-system, system-ui, sans-serif; overflow:hidden; overscroll-behavior:none; }
+  body { display:flex; flex-direction:column; padding-top:env(safe-area-inset-top,0px); }
+  #bar { display:flex; gap:6px; padding:8px; background:var(--bar); border-bottom:1px solid var(--line); flex-wrap:wrap; align-items:center; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:8px; padding:8px 12px; min-width:44px; }
+  button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  #ok { margin-left:auto; background:var(--ok); color:#fff; border-color:var(--ok); font-weight:600; padding:8px 18px; }
+  #ok:disabled { opacity:.5; }
+  #status { width:100%; font-size:13px; min-height:1em; color:#555; }
+  #status.err { color:var(--err); } #status.good { color:var(--ok); }
+  #route { font-size:12px; color:#777; }
+  #wrap { flex:1; position:relative; touch-action:none; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; touch-action:none; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="pen" class="on">Pen</button>
+  <button id="eraser">Eraser</button>
+  <button id="undo">Undo</button>
+  <button id="clear">Clear</button>
+  <span id="route"></span>
+  <button id="ok">OK</button>
+  <div id="status">Write with the Pencil, then tap OK.</div>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+// Two routes, picked by where the page came from:
+//   http  (served by the Mac)   -> Wi-Fi: POST to the Mac
+//   https (GitHub Pages)        -> AirDrop: sign with this device's key, then share
+const AIRDROP = location.protocol === 'https:';
+const KEY_ITEM = 'sketchpad-device-key', NAME_ITEM = 'sketchpad-device-name', DEFAULT_NAME = 'this device';
+const NOT_PAIRED = 'Not paired. On the Mac run: sketchpad pair-airdrop iPad';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const statusEl = document.getElementById('status');
+// done = finished strokes, drawn once into `base`; while writing only the current stroke is redrawn on top.
+let strokes = [], cur = null, mode = 'pen', dpr = 1, rect = null, frame = 0;
+const base = document.createElement('canvas'), bctx = base.getContext('2d');
+
+function getItem(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function setItem(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+// Pairing: the Mac's pair-airdrop link carries the key in the #fragment, which never leaves this device.
+if (AIRDROP && location.hash.includes('pair=')) {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const newKey = h.get('pair') || '', old = getItem(KEY_ITEM);
+  // Ask before a link replaces an existing pairing (a stranger's link would otherwise silently break it).
+  if (/^[0-9a-f]{64}$/.test(newKey) && (!old || old === newKey ||
+      confirm('This device is already paired. Replace its key with the one in this link?'))) {
+    setItem(KEY_ITEM, newKey);
+    setItem(NAME_ITEM, (h.get('name') || DEFAULT_NAME).slice(0, 40));
+  }
+  history.replaceState(null, '', location.pathname);  // remove the key from the address bar
+}
+const key = AIRDROP ? getItem(KEY_ITEM) : null;
+route.textContent = AIRDROP ? 'AirDrop' : 'Wi-Fi';
+if (AIRDROP) say(key ? `Paired as ${getItem(NAME_ITEM) || DEFAULT_NAME}. Write, then tap OK.` : NOT_PAIRED, key ? '' : 'err');
+
+if (AIRDROP && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  rect = cv.getBoundingClientRect();
+  cv.width = base.width = Math.round(rect.width * dpr);
+  cv.height = base.height = Math.round(rect.height * dpr);
+  rebuild();
+}
+function drawStroke(c, s, scale) {
+  c.save();
+  c.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';
+  c.strokeStyle = '#111'; c.lineCap = 'round'; c.lineJoin = 'round';
+  const p = s.pts;
+  // One path per stroke (width from average pressure) so joints leave no dots.
+  c.lineWidth = (s.erase ? 22 : 1.6 + 2.2 * s.pressure / p.length) * scale;
+  c.beginPath(); c.moveTo(p[0][0]*scale, p[0][1]*scale);
+  if (p.length === 1) c.lineTo(p[0][0]*scale + 0.01, p[0][1]*scale);
+  for (let i = 1; i < p.length - 1; i++) {  // smooth through midpoints
+    const mx = (p[i][0] + p[i+1][0]) / 2, my = (p[i][1] + p[i+1][1]) / 2;
+    c.quadraticCurveTo(p[i][0]*scale, p[i][1]*scale, mx*scale, my*scale);
+  }
+  if (p.length > 1) c.lineTo(p[p.length-1][0]*scale, p[p.length-1][1]*scale);
+  c.stroke();
+  c.restore();
+}
+// Full rebuild only on undo / clear / resize / stroke end; while writing, one paint per frame.
+function rebuild() {
+  bctx.clearRect(0, 0, base.width, base.height);
+  strokes.filter(s => s !== cur).forEach(s => drawStroke(bctx, s, dpr));
+  paint();
+}
+function paint() {
+  frame = 0;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(base, 0, 0);
+  if (cur) drawStroke(ctx, cur, dpr);
+}
+function addPoint(e) {
+  const p = e.pressure || 0.5;
+  cur.pts.push([e.clientX - rect.left, e.clientY - rect.top]); cur.pressure += p;
+}
+// Only the Pencil (or a mouse on the Mac) draws, so a resting palm leaves no marks.
+const drawsWith = e => e.pointerType === 'pen' || e.pointerType === 'mouse';
+
+cv.addEventListener('pointerdown', e => {
+  if (!drawsWith(e)) return;
+  e.preventDefault(); cv.setPointerCapture(e.pointerId);
+  rect = cv.getBoundingClientRect();
+  cur = { erase: mode === 'eraser', pts: [], pressure: 0 }; addPoint(e); strokes.push(cur); paint();
+});
+cv.addEventListener('pointermove', e => {
+  if (!cur || !drawsWith(e)) return;
+  e.preventDefault();
+  for (const ev of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e])) addPoint(ev);
+  frame = frame || requestAnimationFrame(paint);
+});
+const end = () => { if (cur) { drawStroke(bctx, cur, dpr); cur = null; paint(); } };
+cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end);
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+function setMode(m) { mode = m; pen.classList.toggle('on', m === 'pen'); eraser.classList.toggle('on', m === 'eraser'); }
+pen.onclick = () => setMode('pen');
+eraser.onclick = () => setMode('eraser');
+undo.onclick = () => { strokes.pop(); rebuild(); };
+function wipe() { strokes = []; rebuild(); }
+clear.onclick = () => { wipe(); say('Cleared.'); };
+
+function say(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
+
+async function exportPng() {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const s of strokes) if (!s.erase) for (const [x, y] of s.pts) {
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+  }
+  if (x0 === Infinity) return null;
+  const pad = 24, scale = 2;
+  x0 -= pad; y0 -= pad; x1 += pad; y1 += pad;
+  const W = Math.ceil((x1 - x0) * scale), H = Math.ceil((y1 - y0) * scale);
+  const layer = document.createElement('canvas'); layer.width = W; layer.height = H;
+  const lc = layer.getContext('2d'); lc.translate(-x0 * scale, -y0 * scale);
+  strokes.forEach(s => drawStroke(lc, s, scale));
+  const out = document.createElement('canvas'); out.width = W; out.height = H;
+  const oc = out.getContext('2d'); oc.fillStyle = '#fff'; oc.fillRect(0, 0, W, H); oc.drawImage(layer, 0, 0);
+  return new Promise(res => out.toBlob(res, 'image/png'));
+}
+
+const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+const stamp = () => { const d = new Date(), z = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${z(d.getMonth()+1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`; };
+
+async function sendAirDrop(blob) {
+  if (!key) return say(NOT_PAIRED, 'err');
+  const bytes = await blob.arrayBuffer();
+  const k = await crypto.subtle.importKey('raw', new Uint8Array(key.match(/../g).map(h => parseInt(h, 16))),
+                                          { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = hex(await crypto.subtle.sign('HMAC', k, bytes)).slice(0, 32);
+  const file = new File([bytes], `Sketch-${stamp()}-${sig}.png`, { type: 'image/png' });
+  if (!navigator.canShare || !navigator.canShare({ files: [file] })) return say("This browser can't share files.", 'err');
+  try {
+    await navigator.share({ files: [file] });
+    wipe(); say('Shared. It reaches Claude a few seconds after the AirDrop.', 'good');
+  } catch (err) { say(err.name === 'AbortError' ? 'Not sent.' : 'Sharing failed: ' + err.message, 'err'); }
+}
+
+async function sendWifi(blob) {
+  try {
+    const r = await fetch('/send' + location.search, { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob });
+    const t = await r.text();
+    if (r.ok) { wipe(); say(t, 'good'); } else say(t, 'err');
+  } catch (err) { say("Can't reach the Mac. Is Sketchpad running, and is this network approved?", 'err'); }
+}
+
+ok.onclick = async () => {
+  const blob = await exportPng();
+  if (!blob) return say('Nothing written yet.', 'err');
+  ok.disabled = true; say('Sending…');
+  await (AIRDROP ? sendAirDrop(blob) : sendWifi(blob));
+  ok.disabled = false;
+};
+
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
