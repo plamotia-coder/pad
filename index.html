@@ -17,12 +17,16 @@
   * { box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
   html, body { margin:0; height:100%; background:var(--bg); font:15px -apple-system, system-ui, sans-serif; overflow:hidden; overscroll-behavior:none; }
   body { display:flex; flex-direction:column; padding-top:env(safe-area-inset-top,0px); }
-  #bar { display:flex; gap:6px; padding:8px; background:var(--bar); border-bottom:1px solid var(--line); flex-wrap:wrap; align-items:center; }
-  button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:8px; padding:8px 12px; min-width:44px; }
+  /* Centred so the window's own close/resize buttons (top left) don't cover the tools in a small window. */
+  #bar { display:flex; gap:6px; padding:8px; background:var(--bar); border-bottom:1px solid var(--line); flex-wrap:wrap; align-items:center; justify-content:center; }
+  button { touch-action:manipulation; font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:8px; padding:8px 12px; min-width:44px; }
   button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
-  #ok { margin-left:auto; background:var(--ok); color:#fff; border-color:var(--ok); font-weight:600; padding:8px 18px; }
+  #tools { display:flex; gap:6px; flex-wrap:wrap; align-items:center; justify-content:center; }
+  /* Small window: keep the corners free for the window buttons. */
+  @media (max-width: 700px) { #tools { padding-inline:72px; } button { padding:8px 9px; } }
+  #ok { background:var(--ok); color:#fff; border-color:var(--ok); font-weight:600; padding:8px 18px; }
   #ok:disabled { opacity:.5; }
-  #status { width:100%; font-size:13px; min-height:1em; color:#555; }
+  #status { width:100%; text-align:center; font-size:13px; min-height:1em; color:#555; }
   #status.err { color:var(--err); } #status.good { color:var(--ok); }
   #route { font-size:12px; color:#777; }
   #pairbox { width:100%; display:flex; gap:6px; }
@@ -34,27 +38,31 @@
 </head>
 <body>
 <div id="bar">
+  <div id="tools">
   <button id="pen" class="on">Pen</button>
   <button id="eraser">Eraser</button>
   <button id="undo">Undo</button>
   <button id="clear">Clear</button>
   <span id="route"></span>
   <button id="ok">OK</button>
+  </div>
   <div id="status">Write with the Pencil, then tap OK.</div>
   <div id="pairbox" hidden>
     <input id="pairlink" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
-           placeholder="Paste the pairing link here (from: sketchpad pair-airdrop iPad)">
+           placeholder="Paste the pairing link here">
     <button id="pairbtn">Pair</button>
   </div>
 </div>
 <div id="wrap"><canvas id="c"></canvas></div>
 <script>
 // Two routes, picked by where the page came from:
-//   http  (served by the Mac)   -> Wi-Fi: POST to the Mac
-//   https (GitHub Pages)        -> AirDrop: sign with this device's key, then share
+//   http  (served by the Mac)   -> Wi-Fi: sign with this device's Wi-Fi key, POST to the Mac
+//   https (GitHub Pages)        -> AirDrop: sign with this device's AirDrop key, then share
+// Each route has its own key (browsers keep each site's storage apart).
 const AIRDROP = location.protocol === 'https:';
 const KEY_ITEM = 'sketchpad-device-key', NAME_ITEM = 'sketchpad-device-name', DEFAULT_NAME = 'this device';
-const NOT_PAIRED = 'Not paired. On the Mac run: sketchpad pair-airdrop iPad';
+const PAIR_CMD = AIRDROP ? '/sketchpad-airdrop-pair' : '/sketchpad-wifi-pair';
+const NOT_PAIRED = `Not paired. On the Mac run ${PAIR_CMD}`;
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const statusEl = document.getElementById('status');
 // done = finished strokes, drawn once into `base`; while writing only the current stroke is redrawn on top.
@@ -64,39 +72,51 @@ const base = document.createElement('canvas'), bctx = base.getContext('2d');
 function getItem(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 function setItem(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
-// Pairing: the Mac's pair-airdrop link carries the key in the #fragment, which never leaves this device.
+// Pairing: the Mac's pair link carries the key in the #fragment, which never leaves this device.
 // It can arrive in the address bar (Safari) or be pasted into the box (Home Screen app, which has its
-// own storage and no address bar).
-function pairFrom(text) {
+// own storage and no address bar). On Wi-Fi the Mac must confirm the key (within its 2 minutes)
+// before it is kept; AirDrop has no line back to the Mac, so its key is kept at once.
+async function pairFrom(text) {
   const h = new URLSearchParams((text.split('#')[1] || ''));
   const newKey = h.get('pair') || '', old = getItem(KEY_ITEM);
-  if (!/^[0-9a-f]{64}$/.test(newKey)) return false;
+  const name = (h.get('name') || DEFAULT_NAME).slice(0, 40);
+  if (!/^[0-9a-f]{64}$/.test(newKey)) return "That isn't a pairing link. Copy it again with " + PAIR_CMD;
   // Ask before a link replaces an existing pairing (a stranger's link would otherwise silently break it).
-  if (old && old !== newKey && !confirm('This device is already paired. Replace its key with the one in this link?')) return false;
+  if (old && old !== newKey && !confirm('This device is already paired. Replace its key with the one in this link?')) return 'Kept the old pairing.';
+  // Safari and the Home Screen icon keep separate storage: pairing in Safari leaves the icon unpaired.
+  if (navigator.standalone === false && !confirm('You are in Safari, not the Sketchpad Home Screen icon. The icon will stay unpaired. Pair here anyway?')) return 'Not paired. Open the Home Screen icon and paste the link there.';
+  if (!AIRDROP) {
+    const t = String(Date.now());
+    try {
+      const r = await fetch('/pair', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, t, sig: hmacHex(newKey, new TextEncoder().encode(`pair|${name}|${t}`)) }) });
+      if (!r.ok) return await r.text();
+    } catch (err) { return "Can't reach the Mac. Is Sketchpad running, and is this network approved?"; }
+  }
   setItem(KEY_ITEM, newKey);
-  setItem(NAME_ITEM, (h.get('name') || DEFAULT_NAME).slice(0, 40));
-  return true;
+  setItem(NAME_ITEM, name);
+  return '';
 }
-if (AIRDROP && location.hash.includes('pair=')) {
-  pairFrom(location.href);
-  history.replaceState(null, '', location.pathname);  // remove the key from the address bar
-}
-let key = AIRDROP ? getItem(KEY_ITEM) : null;
+let key = getItem(KEY_ITEM);
 route.textContent = AIRDROP ? 'AirDrop' : 'Wi-Fi';
 function showPairing() {
-  if (!AIRDROP) return;
   pairbox.hidden = !!key;
   say(key ? `Paired as ${getItem(NAME_ITEM) || DEFAULT_NAME}. Write, then tap OK.`
-          : 'Not paired. On the Mac run: sketchpad pair-airdrop iPad, then paste the link below.', key ? '' : 'err');
+          : `Not paired. On the Mac run ${PAIR_CMD}, then paste the link below.`, key ? '' : 'err');
 }
-const pairNow = () => {
-  const ok = pairFrom(pairlink.value.trim());
-  pairlink.value = '';  // never leave the key sitting in the box
+async function pairWith(text) {
+  const err = await pairFrom(text);
   key = getItem(KEY_ITEM);
   showPairing();
-  if (!ok) say("That isn't a pairing link. Copy it again with: sketchpad pair-airdrop iPad", 'err');
-};
+  if (err) say(err, 'err');
+}
+const pairNow = () => { const v = pairlink.value.trim(); pairlink.value = ''; pairWith(v); };  // never leave the key in the box
 showPairing();
+if (location.hash.includes('pair=')) {
+  const link = location.href;
+  history.replaceState(null, '', location.pathname);  // remove the key from the address bar
+  pairWith(link);
+}
 
 if (AIRDROP && 'serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
@@ -145,7 +165,8 @@ const drawsWith = e => e.pointerType === 'pen' || e.pointerType === 'mouse';
 
 cv.addEventListener('pointerdown', e => {
   if (!drawsWith(e)) return;
-  e.preventDefault(); cv.setPointerCapture(e.pointerId);
+  e.preventDefault();
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}  // nice to have; drawing works without it
   rect = cv.getBoundingClientRect();
   cur = { erase: mode === 'eraser', pts: [], pressure: 0 }; addPoint(e); strokes.push(cur); paint();
 });
@@ -156,22 +177,26 @@ cv.addEventListener('pointermove', e => {
   frame = frame || requestAnimationFrame(paint);
 });
 const end = () => { if (cur) { drawStroke(bctx, cur, dpr); cur = null; paint(); } };
-cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end);
+// End the stroke however the Pencil leaves: lifted anywhere on the page, cancelled, or capture lost.
+for (const ev of ['pointerup', 'pointercancel']) window.addEventListener(ev, end);
+cv.addEventListener('lostpointercapture', end);
 document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
 
-// Buttons react to a Pencil tap as well as a finger or mouse: run on pointerup from any pointer,
-// and ignore the click that may follow, so an action never runs twice.
-function tap(el, fn) {
+// Buttons react to a Pencil tap as well as a finger or mouse, and an action never runs twice.
+// Tool buttons fire on touch-down (iPadOS can cancel a Pencil tap before it lifts); OK and Pair
+// fire on lift, because opening the share menu needs a completed tap.
+function tap(el, fn, onDown = false) {
   let last = 0;
-  el.addEventListener('pointerup', e => { if (e.button > 0) return; last = Date.now(); e.preventDefault(); fn(); });
-  el.addEventListener('click', e => { if (Date.now() - last > 600) fn(); });
+  const run = e => { if (e.button > 0) return; last = Date.now(); e.preventDefault(); fn(); };
+  el.addEventListener(onDown ? 'pointerdown' : 'pointerup', run);
+  el.addEventListener('click', () => { if (Date.now() - last > 600) fn(); });
 }
 function setMode(m) { mode = m; pen.classList.toggle('on', m === 'pen'); eraser.classList.toggle('on', m === 'eraser'); }
-tap(pen, () => setMode('pen'));
-tap(eraser, () => setMode('eraser'));
-tap(undo, () => { strokes.pop(); rebuild(); });
-function wipe() { strokes = []; rebuild(); }
-tap(clear, () => { wipe(); say('Cleared.'); });
+tap(pen, () => setMode('pen'), true);
+tap(eraser, () => setMode('eraser'), true);
+tap(undo, () => { cur = null; strokes.pop(); rebuild(); }, true);
+function wipe() { cur = null; strokes = []; rebuild(); }
+tap(clear, () => { wipe(); say('Cleared.'); }, true);
 tap(pairbtn, pairNow);
 
 function say(t, cls) { statusEl.textContent = t; statusEl.className = cls || ''; }
@@ -194,6 +219,47 @@ async function exportPng() {
 }
 
 const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+
+// SHA-256 and HMAC in plain JS: Safari offers crypto.subtle only on https pages, and the Wi-Fi page is http.
+const K256 = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,
+  0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,
+  0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,
+  0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,
+  0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+function sha256(msg) {  // Uint8Array -> Uint8Array(32)
+  const len = msg.length, total = Math.ceil((len + 9) / 64) * 64, m = new Uint8Array(total);
+  m.set(msg); m[len] = 0x80;
+  const dv = new DataView(m.buffer);
+  dv.setUint32(total - 8, Math.floor(len / 0x20000000)); dv.setUint32(total - 4, (len * 8) >>> 0);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const W = new Uint32Array(64), rotr = (x, n) => (x >>> n) | (x << (32 - n));
+  for (let o = 0; o < total; o += 64) {
+    for (let i = 0; i < 16; i++) W[i] = dv.getUint32(o + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const a = W[i-15], b = W[i-2];
+      W[i] = W[i-16] + (rotr(a,7) ^ rotr(a,18) ^ (a >>> 3)) + W[i-7] + (rotr(b,17) ^ rotr(b,19) ^ (b >>> 10));
+    }
+    let [a, b, c, d, e, f, g, h] = H;
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (rotr(e,6) ^ rotr(e,11) ^ rotr(e,25)) + ((e & f) ^ (~e & g)) + K256[i] + W[i]) >>> 0;
+      const t2 = ((rotr(a,2) ^ rotr(a,13) ^ rotr(a,22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  H.forEach((v, i) => ov.setUint32(i * 4, v));
+  return out;
+}
+function hmacHex(keyHex, bytes) {  // HMAC-SHA256 with a hex key (<= 64 bytes), as hex
+  const k = new Uint8Array(64); k.set(keyHex.match(/../g).map(x => parseInt(x, 16)));
+  const ipad = k.map(x => x ^ 0x36), opad = k.map(x => x ^ 0x5c);
+  const inner = new Uint8Array(64 + bytes.length); inner.set(ipad); inner.set(bytes, 64);
+  const outer = new Uint8Array(96); outer.set(opad); outer.set(sha256(inner), 64);
+  return hex(sha256(outer));
+}
 const stamp = () => { const d = new Date(), z = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}${z(d.getMonth()+1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`; };
 
@@ -212,10 +278,15 @@ async function sendAirDrop(blob) {
 }
 
 async function sendWifi(blob) {
+  if (!key) return say(NOT_PAIRED, 'err');
+  const bytes = new Uint8Array(await blob.arrayBuffer()), t = String(Date.now());
+  const head = new TextEncoder().encode(t + '\n'), msg = new Uint8Array(head.length + bytes.length);
+  msg.set(head); msg.set(bytes, head.length);
   try {
-    const r = await fetch('/send' + location.search, { method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob });
-    const t = await r.text();
-    if (r.ok) { wipe(); say(t, 'good'); } else say(t, 'err');
+    const r = await fetch('/send', { method: 'POST', body: bytes, headers: { 'Content-Type': 'image/png',
+      'X-Sketchpad-Device': getItem(NAME_ITEM) || DEFAULT_NAME, 'X-Sketchpad-Time': t, 'X-Sketchpad-Sig': hmacHex(key, msg) } });
+    const reply = await r.text();
+    if (r.ok) { wipe(); say(reply, 'good'); } else say(reply, 'err');
   } catch (err) { say("Can't reach the Mac. Is Sketchpad running, and is this network approved?", 'err'); }
 }
 
